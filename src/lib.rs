@@ -31,6 +31,10 @@ pub struct KeyPress {
 pub struct TypingStats {
     window_ms: u64,
     events: VecDeque<KeyPress>,
+    /// Total presses ever recorded (all-time, never pruned).
+    total_keys_ever: u64,
+    /// All-time press counts per physical key code.
+    heat_counts: std::collections::BTreeMap<u16, u64>,
 }
 
 impl TypingStats {
@@ -38,11 +42,18 @@ impl TypingStats {
         if window_ms == 0 {
             return Err(KeyGlowError::BadWindow(0));
         }
-        Ok(Self { window_ms, events: VecDeque::new() })
+        Ok(Self {
+            window_ms,
+            events: VecDeque::new(),
+            total_keys_ever: 0,
+            heat_counts: std::collections::BTreeMap::new(),
+        })
     }
 
     pub fn record(&mut self, code: u16, at_ms: u64) {
         self.events.push_back(KeyPress { code, at_ms });
+        self.total_keys_ever += 1;
+        *self.heat_counts.entry(code).or_default() += 1;
         self.prune(at_ms);
     }
 
@@ -68,6 +79,27 @@ impl TypingStats {
             .iter()
             .filter(|p| now_ms.saturating_sub(p.at_ms) <= self.window_ms)
             .count()
+    }
+
+    /// All-time total number of key presses recorded by this instance.
+    pub fn total_keys_ever(&self) -> u64 {
+        self.total_keys_ever
+    }
+
+    /// All-time press counts per physical key code, sorted by code.
+    pub fn heat(&self) -> Vec<(u16, u64)> {
+        self.heat_counts.iter().map(|(c, n)| (*c, *n)).collect()
+    }
+
+    /// Strokes per minute inside the window: `keys * 60000 / min(window_ms, 60_000)`,
+    /// floored. Returns 0 when the window holds no events. Based on the currently
+    /// stored (pruned) events — call `record`/`keys_in_window` semantics unchanged.
+    pub fn strokes_per_minute(&self) -> u64 {
+        let keys = self.events.len() as u64;
+        if keys == 0 {
+            return 0;
+        }
+        keys * 60_000 / self.window_ms.min(60_000)
     }
 
     /// Per-key press counts inside the window, sorted by code.
@@ -146,6 +178,51 @@ mod tests {
         stats.record(48, 500);
         stats.record(30, 5_000); // window cutoff at 4000ms
         assert_eq!(stats.keys_in_window(5_000), 1);
+    }
+
+    #[test]
+    fn strokes_per_minute_scales_and_floors() {
+        let mut stats = TypingStats::new(60_000).unwrap();
+        assert_eq!(stats.strokes_per_minute(), 0); // empty → 0
+        for i in 0..30 {
+            stats.record(30, i * 1_000);
+        }
+        assert_eq!(stats.strokes_per_minute(), 30); // 30 * 60000 / 60000
+
+        // A 5-second window: rate is normalized to a minute.
+        let mut fast = TypingStats::new(5_000).unwrap();
+        for i in 0..10 {
+            fast.record(30, i * 100);
+        }
+        assert_eq!(fast.strokes_per_minute(), 10 * 60_000 / 5_000);
+    }
+
+    #[test]
+    fn strokes_per_minute_uses_stored_events_after_prune() {
+        let mut stats = TypingStats::new(1_000).unwrap();
+        stats.record(30, 0);
+        stats.record(48, 5_000); // prunes the t=0 event
+        assert_eq!(stats.strokes_per_minute(), 1 * 60_000 / 1_000);
+    }
+
+    #[test]
+    fn heat_and_total_keys_ever_are_all_time() {
+        let mut stats = TypingStats::new(500).unwrap();
+        stats.record(30, 0);
+        stats.record(30, 100);
+        stats.record(48, 200);
+        stats.record(48, 99_000); // prunes old events from the window…
+        assert_eq!(stats.keys_in_window(99_000), 1);
+        // …but the all-time counters keep everything
+        assert_eq!(stats.total_keys_ever(), 4);
+        assert_eq!(stats.heat(), vec![(30, 2), (48, 2)]);
+    }
+
+    #[test]
+    fn heat_empty_before_any_press() {
+        let stats = TypingStats::new(1_000).unwrap();
+        assert_eq!(stats.total_keys_ever(), 0);
+        assert!(stats.heat().is_empty());
     }
 
     #[test]
